@@ -91,29 +91,48 @@ def main(args):
         print(f"Saving .png samples at {sample_folder_dir}")
     dist.barrier()
 
-    # Figure out how many samples we need to generate on each GPU and how many iterations we need to run:
-    n = args.per_proc_batch_size
-    global_batch_size = n * dist.get_world_size()
-    # To make things evenly-divisible, we'll sample a bit more than we need and then discard the extra samples:
-    total_samples = int(math.ceil(args.num_fid_samples / global_batch_size) * global_batch_size)
+    # Generate class IDs: 0-9, 100-109, 200-209, ..., 900-909
+    class_ids = []
+    for base in range(0, 1000, 100):
+        class_ids.extend(range(base, base + 10))
+    
+    # Each class samples 5 images
+    samples_per_class = 5
+    total_samples = len(class_ids) * samples_per_class
+    
     if rank == 0:
         print(f"Total number of images that will be sampled: {total_samples}")
-    assert total_samples % dist.get_world_size() == 0, "total_samples must be divisible by world_size"
+        print(f"Class IDs: {class_ids}")
+    
+    # Distribute samples across GPUs
+    global_batch_size = dist.get_world_size()
+    assert total_samples % global_batch_size == 0, "total_samples must be divisible by world_size"
     samples_needed_this_gpu = int(total_samples // dist.get_world_size())
-    assert samples_needed_this_gpu % n == 0, "samples_needed_this_gpu must be divisible by the per-GPU batch size"
-    iterations = int(samples_needed_this_gpu // n)
-    pbar = range(iterations)
+    
+    # Build sample list: (class_id, sample_index_within_class)
+    all_samples = []
+    for class_id in class_ids:
+        for sample_idx in range(samples_per_class):
+            all_samples.append((class_id, sample_idx))
+    
+    # Distribute to this GPU
+    this_gpu_samples = all_samples[rank::dist.get_world_size()]
+    
+    pbar = range(len(this_gpu_samples))
     pbar = tqdm(pbar) if rank == 0 else pbar
-    total = 0
-    for _ in pbar:
+    
+    # Store filename to class_id mapping
+    filename_to_class_id = []
+    
+    for idx, (class_id, _) in enumerate(pbar):
         # Sample inputs:
-        z = torch.randn(n, model.in_channels, latent_size, latent_size, device=device)
-        y = torch.randint(0, args.num_classes, (n,), device=device)
+        z = torch.randn(1, model.in_channels, latent_size, latent_size, device=device)
+        y = torch.tensor([class_id], device=device)
 
         # Setup classifier-free guidance:
         if using_cfg:
             z = torch.cat([z, z], 0)
-            y_null = torch.tensor([1000] * n, device=device)
+            y_null = torch.tensor([1000] * 1, device=device)
             y = torch.cat([y, y_null], 0)
             model_kwargs = dict(y=y, cfg_scale=args.cfg_scale)
             sample_fn = model.forward_with_cfg
@@ -133,15 +152,48 @@ def main(args):
 
         # Save samples to disk as individual .png files
         for i, sample in enumerate(samples):
-            index = i * dist.get_world_size() + rank + total
-            Image.fromarray(sample).save(f"{sample_folder_dir}/{index:06d}.png")
-        total += global_batch_size
-
-    # Make sure all processes have finished saving their samples before attempting to convert to .npz
+            # Calculate global index
+            global_idx = idx * dist.get_world_size() + rank
+            filename = f"{global_idx:06d}"
+            Image.fromarray(sample).save(f"{sample_folder_dir}/{filename}.png")
+            filename_to_class_id.append((filename, class_id))
+    
+    # Save results to temporary files (one per rank)
+    temp_file = f"{sample_folder_dir}/temp_rank_{rank}.txt"
+    with open(temp_file, "w") as f:
+        for filename, class_id in filename_to_class_id:
+            f.write(f"{filename} {class_id}\n")
+    
     dist.barrier()
+    
+    # Rank 0 collects all results and creates final class_ids.txt
     if rank == 0:
-        create_npz_from_sample_folder(sample_folder_dir, args.num_fid_samples)
+        all_entries = []
+        for src_rank in range(dist.get_world_size()):
+            temp_file = f"{sample_folder_dir}/temp_rank_{src_rank}.txt"
+            with open(temp_file, "r") as f:
+                for line in f:
+                    parts = line.strip().split()
+                    if len(parts) == 2:
+                        all_entries.append((parts[0], int(parts[1])))
+        
+        # Sort by filename
+        all_entries.sort(key=lambda x: x[0])
+        
+        # Save class_ids.txt
+        with open(f"{sample_folder_dir}/class_ids.txt", "w") as f:
+            for filename, class_id in all_entries:
+                f.write(f"{filename} {class_id}\n")
+        
+        # Clean up temp files
+        for src_rank in range(dist.get_world_size()):
+            temp_file = f"{sample_folder_dir}/temp_rank_{src_rank}.txt"
+            if os.path.exists(temp_file):
+                os.remove(temp_file)
+        
+        print(f"Saved class_ids.txt with {len(all_entries)} entries")
         print("Done.")
+    
     dist.barrier()
     dist.destroy_process_group()
 
@@ -151,7 +203,7 @@ if __name__ == "__main__":
     parser.add_argument("--model", type=str, choices=list(DiT_models.keys()), default="DiT-XL/2")
     parser.add_argument("--vae",  type=str, choices=["ema", "mse"], default="ema")
     parser.add_argument("--sample-dir", type=str, default="samples")
-    parser.add_argument("--per-proc-batch-size", type=int, default=32)
+    parser.add_argument("--per-proc-batch-size", type=int, default=10)
     parser.add_argument("--num-fid-samples", type=int, default=50_000)
     parser.add_argument("--image-size", type=int, choices=[256, 512], default=256)
     parser.add_argument("--num-classes", type=int, default=1000)
