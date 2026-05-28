@@ -104,35 +104,40 @@ def main(args):
         print(f"Total number of images that will be sampled: {total_samples}")
         print(f"Class IDs: {class_ids}")
     
-    # Distribute samples across GPUs
-    global_batch_size = dist.get_world_size()
-    assert total_samples % global_batch_size == 0, "total_samples must be divisible by world_size"
-    samples_needed_this_gpu = int(total_samples // dist.get_world_size())
-    
     # Build sample list: (class_id, sample_index_within_class)
     all_samples = []
     for class_id in class_ids:
         for sample_idx in range(samples_per_class):
-            all_samples.append((class_id, sample_idx))
+            all_samples.append(class_id)
     
     # Distribute to this GPU
     this_gpu_samples = all_samples[rank::dist.get_world_size()]
     
-    pbar = range(len(this_gpu_samples))
+    # Process in batches
+    n = args.per_proc_batch_size
+    num_iterations = int(math.ceil(len(this_gpu_samples) / n))
+    
+    pbar = range(num_iterations)
     pbar = tqdm(pbar) if rank == 0 else pbar
     
     # Store filename to class_id mapping
     filename_to_class_id = []
     
-    for idx, (class_id, _) in enumerate(pbar):
+    for iteration in pbar:
+        # Get class IDs for this batch
+        start_idx = iteration * n
+        end_idx = min(start_idx + n, len(this_gpu_samples))
+        batch_class_ids = this_gpu_samples[start_idx:end_idx]
+        actual_batch_size = len(batch_class_ids)
+        
         # Sample inputs:
-        z = torch.randn(1, model.in_channels, latent_size, latent_size, device=device)
-        y = torch.tensor([class_id], device=device)
+        z = torch.randn(actual_batch_size, model.in_channels, latent_size, latent_size, device=device)
+        y = torch.tensor(batch_class_ids, device=device)
 
         # Setup classifier-free guidance:
         if using_cfg:
             z = torch.cat([z, z], 0)
-            y_null = torch.tensor([1000] * 1, device=device)
+            y_null = torch.tensor([1000] * actual_batch_size, device=device)
             y = torch.cat([y, y_null], 0)
             model_kwargs = dict(y=y, cfg_scale=args.cfg_scale)
             sample_fn = model.forward_with_cfg
@@ -153,10 +158,10 @@ def main(args):
         # Save samples to disk as individual .png files
         for i, sample in enumerate(samples):
             # Calculate global index
-            global_idx = idx * dist.get_world_size() + rank
+            global_idx = (start_idx + i) * dist.get_world_size() + rank
             filename = f"{global_idx:06d}"
             Image.fromarray(sample).save(f"{sample_folder_dir}/{filename}.png")
-            filename_to_class_id.append((filename, class_id))
+            filename_to_class_id.append((filename, batch_class_ids[i]))
     
     # Save results to temporary files (one per rank)
     temp_file = f"{sample_folder_dir}/temp_rank_{rank}.txt"
