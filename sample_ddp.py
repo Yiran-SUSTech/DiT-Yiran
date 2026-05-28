@@ -11,6 +11,9 @@ evaluation metrics via the ADM repo: https://github.com/openai/guided-diffusion/
 
 For a simple single-GPU/CPU sampling script, see sample.py.
 """
+import os
+os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
+
 import torch
 import torch.distributed as dist
 from models import DiT_models
@@ -18,7 +21,6 @@ from download import find_model
 from diffusion import create_diffusion
 from diffusers.models import AutoencoderKL
 from tqdm import tqdm
-import os
 from PIL import Image
 import numpy as np
 import math
