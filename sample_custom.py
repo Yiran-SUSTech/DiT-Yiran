@@ -66,10 +66,11 @@ def main(args):
     using_cfg = args.cfg_scale > 1.0
 
     # Create folder to save samples:
+    class_ids = [int(x) for x in args.class_id_list.split(",")]
     model_string_name = args.model.replace("/", "-")
     ckpt_string_name = os.path.basename(args.ckpt).replace(".pt", "") if args.ckpt else "pretrained"
     folder_name = f"{model_string_name}-{ckpt_string_name}-size-{args.image_size}-vae-{args.vae}-" \
-                  f"cfg-{args.cfg_scale}-seed-{args.global_seed}"
+                  f"cfg-{args.cfg_scale}-seed-{args.global_seed}-sample_class_num-{len(class_ids)}"
     sample_folder_dir = f"{args.sample_dir}/{folder_name}"
     if rank == 0:
         os.makedirs(sample_folder_dir, exist_ok=True)
@@ -77,7 +78,7 @@ def main(args):
     dist.barrier()
 
     # Parse class_id_list
-    class_ids = [int(x) for x in args.class_id_list.split(",")]
+    # class_ids = [int(x) for x in args.class_id_list.split(",")]
     samples_per_class = args.num_image_per_class
     total_samples = len(class_ids) * samples_per_class
 
