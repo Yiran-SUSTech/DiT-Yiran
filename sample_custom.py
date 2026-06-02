@@ -1,0 +1,206 @@
+import os
+os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
+
+import torch
+import torch.distributed as dist
+from models import DiT_models
+from download import find_model
+from diffusion import create_diffusion
+from diffusers.models import AutoencoderKL
+from tqdm import tqdm
+from PIL import Image
+import numpy as np
+import math
+import argparse
+
+
+def create_npz_from_sample_folder(sample_dir, num):
+    """
+    Builds a single .npz file from a folder of .png samples.
+    """
+    samples = []
+    for i in tqdm(range(num), desc="Building .npz file from samples"):
+        sample_pil = Image.open(f"{sample_dir}/{i:06d}.png")
+        sample_np = np.asarray(sample_pil).astype(np.uint8)
+        samples.append(sample_np)
+    samples = np.stack(samples)
+    assert samples.shape == (num, samples.shape[1], samples.shape[2], 3)
+    npz_path = f"{sample_dir}.npz"
+    np.savez(npz_path, arr_0=samples)
+    print(f"Saved .npz file to {npz_path} [shape={samples.shape}].")
+    return npz_path
+
+
+def main(args):
+    torch.backends.cuda.matmul.allow_tf32 = args.tf32
+    assert torch.cuda.is_available(), "Sampling with DDP requires at least one GPU."
+    torch.set_grad_enabled(False)
+
+    # Setup DDP:
+    dist.init_process_group("nccl")
+    rank = dist.get_rank()
+    device = rank % torch.cuda.device_count()
+    seed = args.global_seed * dist.get_world_size() + rank
+    torch.manual_seed(seed)
+    torch.cuda.set_device(device)
+    print(f"Starting rank={rank}, seed={seed}, world_size={dist.get_world_size()}.")
+
+    if args.ckpt is None:
+        assert args.model == "DiT-XL/2", "Only DiT-XL/2 models are available for auto-download."
+        assert args.image_size in [256, 512]
+        assert args.num_classes == 1000
+
+    # Load model:
+    latent_size = args.image_size // 8
+    model = DiT_models[args.model](
+        input_size=latent_size,
+        num_classes=args.num_classes
+    ).to(device)
+    ckpt_path = args.ckpt or f"DiT-XL-2-{args.image_size}x{args.image_size}.pt"
+    state_dict = find_model(ckpt_path)
+    model.load_state_dict(state_dict)
+    model.eval()
+    diffusion = create_diffusion(str(args.num_sampling_steps))
+    vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
+    assert args.cfg_scale >= 1.0, "In almost all cases, cfg_scale be >= 1.0"
+    using_cfg = args.cfg_scale > 1.0
+
+    # Create folder to save samples:
+    model_string_name = args.model.replace("/", "-")
+    ckpt_string_name = os.path.basename(args.ckpt).replace(".pt", "") if args.ckpt else "pretrained"
+    folder_name = f"{model_string_name}-{ckpt_string_name}-size-{args.image_size}-vae-{args.vae}-" \
+                  f"cfg-{args.cfg_scale}-seed-{args.global_seed}"
+    sample_folder_dir = f"{args.sample_dir}/{folder_name}"
+    if rank == 0:
+        os.makedirs(sample_folder_dir, exist_ok=True)
+        print(f"Saving .png samples at {sample_folder_dir}")
+    dist.barrier()
+
+    # Parse class_id_list
+    class_ids = [int(x) for x in args.class_id_list.split(",")]
+    samples_per_class = args.num_image_per_class
+    total_samples = len(class_ids) * samples_per_class
+
+    if rank == 0:
+        print(f"Total number of images that will be sampled: {total_samples}")
+        print(f"Class IDs: {class_ids}")
+        print(f"Samples per class: {samples_per_class}")
+
+    # Build sample list
+    all_samples = []
+    for class_id in class_ids:
+        for _ in range(samples_per_class):
+            all_samples.append(class_id)
+
+    # Distribute to this GPU
+    this_gpu_samples = all_samples[rank::dist.get_world_size()]
+
+    # Process in batches
+    n = args.per_proc_batch_size
+    num_iterations = int(math.ceil(len(this_gpu_samples) / n))
+
+    pbar = range(num_iterations)
+    pbar = tqdm(pbar) if rank == 0 else pbar
+
+    # Store filename to class_id mapping
+    filename_to_class_id = []
+
+    for iteration in pbar:
+        start_idx = iteration * n
+        end_idx = min(start_idx + n, len(this_gpu_samples))
+        batch_class_ids = this_gpu_samples[start_idx:end_idx]
+        actual_batch_size = len(batch_class_ids)
+
+        # Sample inputs:
+        z = torch.randn(actual_batch_size, model.in_channels, latent_size, latent_size, device=device)
+        y = torch.tensor(batch_class_ids, device=device)
+
+        # Setup classifier-free guidance:
+        if using_cfg:
+            z = torch.cat([z, z], 0)
+            y_null = torch.tensor([1000] * actual_batch_size, device=device)
+            y = torch.cat([y, y_null], 0)
+            model_kwargs = dict(y=y, cfg_scale=args.cfg_scale)
+            sample_fn = model.forward_with_cfg
+        else:
+            model_kwargs = dict(y=y)
+            sample_fn = model.forward
+
+        # Sample images:
+        samples = diffusion.p_sample_loop(
+            sample_fn, z.shape, z, clip_denoised=False, model_kwargs=model_kwargs, progress=False, device=device
+        )
+        if using_cfg:
+            samples, _ = samples.chunk(2, dim=0)
+
+        samples = vae.decode(samples / 0.18215).sample
+        samples = torch.clamp(127.5 * samples + 128.0, 0, 255).permute(0, 2, 3, 1).to("cpu", dtype=torch.uint8).numpy()
+
+        # Save samples to disk as individual .png files
+        for i, sample in enumerate(samples):
+            global_idx = (start_idx + i) * dist.get_world_size() + rank
+            filename = f"{global_idx:06d}"
+            Image.fromarray(sample).save(f"{sample_folder_dir}/{filename}.png")
+            filename_to_class_id.append((filename, batch_class_ids[i]))
+
+    # Save results to temporary files (one per rank)
+    temp_file = f"{sample_folder_dir}/temp_rank_{rank}.txt"
+    with open(temp_file, "w") as f:
+        for filename, class_id in filename_to_class_id:
+            f.write(f"{filename} {class_id}\n")
+
+    dist.barrier()
+
+    # Rank 0 collects all results and creates final class_ids.txt
+    if rank == 0:
+        all_entries = []
+        for src_rank in range(dist.get_world_size()):
+            temp_file = f"{sample_folder_dir}/temp_rank_{src_rank}.txt"
+            with open(temp_file, "r") as f:
+                for line in f:
+                    parts = line.strip().split()
+                    if len(parts) == 2:
+                        all_entries.append((parts[0], int(parts[1])))
+
+        all_entries.sort(key=lambda x: x[0])
+
+        with open(f"{sample_folder_dir}/class_ids.txt", "w") as f:
+            for filename, class_id in all_entries:
+                f.write(f"{filename} {class_id}\n")
+
+        for src_rank in range(dist.get_world_size()):
+            temp_file = f"{sample_folder_dir}/temp_rank_{src_rank}.txt"
+            if os.path.exists(temp_file):
+                os.remove(temp_file)
+
+        print(f"Saved class_ids.txt with {len(all_entries)} entries")
+
+        # Create .npz file for FID evaluation
+        create_npz_from_sample_folder(sample_folder_dir, total_samples)
+        print("Done.")
+
+    dist.barrier()
+    dist.destroy_process_group()
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model", type=str, choices=list(DiT_models.keys()), default="DiT-XL/2")
+    parser.add_argument("--vae", type=str, choices=["ema", "mse"], default="ema")
+    parser.add_argument("--sample-dir", type=str, default="samples")
+    parser.add_argument("--per-proc-batch-size", type=int, default=10)
+    parser.add_argument("--image-size", type=int, choices=[256, 512], default=256)
+    parser.add_argument("--num-classes", type=int, default=1000)
+    parser.add_argument("--cfg-scale", type=float, default=1.5)
+    parser.add_argument("--num-sampling-steps", type=int, default=250)
+    parser.add_argument("--global-seed", type=int, default=0)
+    parser.add_argument("--tf32", action=argparse.BooleanOptionalAction, default=True,
+                        help="By default, use TF32 matmuls. This massively accelerates sampling on Ampere GPUs.")
+    parser.add_argument("--ckpt", type=str, default=None,
+                        help="Optional path to a DiT checkpoint (default: auto-download a pre-trained DiT-XL/2 model).")
+    parser.add_argument("--class-id-list", type=str, required=True,
+                        help="Comma-separated list of class IDs to sample, e.g., '8,11,26,36,40,50'")
+    parser.add_argument("--num-image-per-class", type=int, default=5,
+                        help="Number of images to sample per class (default: 5)")
+    args = parser.parse_args()
+    main(args)
